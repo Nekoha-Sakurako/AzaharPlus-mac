@@ -40,6 +40,9 @@ void ThreadManager::serialize(Archive& ar, const unsigned int) {
     ar & ready_queue;
     ar & wakeup_callback_table;
     ar & thread_list;
+    ar & current_schedule_mode;
+    ar & single_time_limiter;
+    ar & multi_time_limiter;
 }
 SERIALIZE_IMPL(ThreadManager)
 
@@ -59,6 +62,7 @@ void Thread::serialize(Archive& ar, const unsigned int file_version) {
     ar & held_mutexes;
     ar & pending_mutexes;
     ar & owner_process;
+    ar & resource_limit_category;
     ar & wait_objects;
     ar & wait_address;
     ar & name;
@@ -187,28 +191,13 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
 }
 
 Thread* ThreadManager::PopNextReadyThread() {
-    Thread* next = nullptr;
+    Thread* next;
     Thread* thread = GetCurrentThread();
 
-    if (thread && thread->status == ThreadStatus::Running) {
-        do {
-            // We have to do better than the current thread.
-            // This call returns null when that's not possible.
-            next = ready_queue.pop_first_better(thread->current_priority);
-            if (!next) {
-                // Otherwise just keep going with the current thread
-                next = thread;
-                break;
-            } else if (!next->can_schedule)
-                unscheduled_ready_queue.push_back(next);
-        } while (!next->can_schedule);
-    } else {
-        do {
-            next = ready_queue.pop_first();
-            if (next && !next->can_schedule)
-                unscheduled_ready_queue.push_back(next);
-        } while (next && !next->can_schedule);
-    }
+    while (true) {
+        std::vector<std::pair<u32, Thread*>> skipped;
+        u32 next_priority{};
+        next = nullptr;
 
         if (thread && thread->status == ThreadStatus::Running && thread->CanSchedule()) {
             do {
@@ -431,6 +420,7 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
     thread->name = std::move(name);
     thread_managers[processor_id]->wakeup_callback_table[thread->thread_id] = thread.get();
     thread->owner_process = owner_process;
+    thread->resource_limit_category = owner_process->resource_limit->GetCategory();
     CASCADE_RESULT(thread->tls_address, owner_process->AllocateThreadLocalStorage());
 
     // TODO(peachum): move to ScheduleThread() when scheduler is added so selected core is used
@@ -553,14 +543,6 @@ VAddr Thread::GetCommandBufferAddress() const {
     // Offset from the start of TLS at which the IPC command buffer begins.
     constexpr u32 command_header_offset = 0x80;
     return GetTLSAddress() + command_header_offset;
-}
-
-bool Thread::SetDebugBreak(bool _debug_break) {
-    if (debug_break == _debug_break) {
-        return false;
-    }
-    debug_break = _debug_break;
-    return true;
 }
 
 CpuLimiter::~CpuLimiter() {}
@@ -711,6 +693,10 @@ ThreadManager::ThreadManager(Kernel::KernelSystem& kernel, u32 core_id)
     ThreadWakeupEventType = kernel.timing.RegisterEvent(
         "ThreadWakeupCallback_" + std::to_string(core_id),
         [this](u64 thread_id, s64 cycle_late) { ThreadWakeupCallback(thread_id, cycle_late); });
+    if (core_id == 1) {
+        single_time_limiter.Initialize(true);
+        multi_time_limiter.Initialize(false);
+    }
 }
 
 ThreadManager::~ThreadManager() {
@@ -723,13 +709,33 @@ std::span<const std::shared_ptr<Thread>> ThreadManager::GetThreadList() const {
     return thread_list;
 }
 
+std::shared_ptr<Thread> ThreadManager::GetThreadByID(u32 thread_id) const {
+    for (auto& thread : thread_list) {
+        if (thread->thread_id == thread_id) {
+            return thread;
+        }
+    }
+    return nullptr;
+}
+
+void ThreadManager::SetScheduleMode(Core1ScheduleMode mode) {
+    GetCpuLimiter()->End();
+    current_schedule_mode = mode;
+    if (mode == Core1ScheduleMode::Single) {
+        LOG_WARNING(Kernel, "Unimplemented \"Single\" schedule mode.");
+    }
+    GetCpuLimiter()->Start();
+}
+
+void ThreadManager::UpdateAppCpuLimit() {
+    GetCpuLimiter()->UpdateAppCpuLimit();
+}
+
 std::shared_ptr<Thread> KernelSystem::GetThreadByID(u32 thread_id) const {
     for (u32 core_id = 0; core_id < Core::System::GetInstance().GetNumCores(); core_id++) {
-        const auto thread_list = GetThreadManager(core_id).GetThreadList();
-        for (auto& thread : thread_list) {
-            if (thread->thread_id == thread_id) {
-                return thread;
-            }
+        auto ret = GetThreadManager(core_id).GetThreadByID(thread_id);
+        if (ret) {
+            return ret;
         }
     }
     return nullptr;
