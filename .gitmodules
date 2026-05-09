@@ -109,3 +109,6 @@
 [submodule "externals/libzip"]
 	path = externals/libzip
 	url = https://github.com/nih-at/libzip.git
+[submodule "dllwalker"]
+	path = externals/dllwalker
+	url = https://github.com/azahar-emu/dllwalker
