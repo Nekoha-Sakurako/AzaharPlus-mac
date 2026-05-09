@@ -17,6 +17,9 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/core.h"
+#ifdef ENABLE_GDBSTUB
+#include "core/gdbstub/gdbstub.h"
+#endif
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/mutex.h"
@@ -73,6 +76,7 @@ void Thread::serialize(Archive& ar, const unsigned int file_version) {
         }
     }
     ar & wakeup_callback;
+    ar & debug_break;
 }
 SERIALIZE_IMPL(Thread)
 
@@ -129,6 +133,10 @@ void Thread::Stop() {
         process->tls_slots[tls_page].reset(tls_slot);
         process->resource_limit->Release(ResourceLimitType::Thread, 1);
     }
+
+#ifdef ENABLE_GDBSTUB
+    GDBStub::OnThreadExit(thread_id);
+#endif
 }
 
 void ThreadManager::SwitchContext(Thread* new_thread) {
@@ -202,10 +210,41 @@ Thread* ThreadManager::PopNextReadyThread() {
         } while (next && !next->can_schedule);
     }
 
-    while (!unscheduled_ready_queue.empty()) {
-        auto t = std::move(unscheduled_ready_queue.back());
-        ready_queue.push_back(t->current_priority, t);
-        unscheduled_ready_queue.pop_back();
+        if (thread && thread->status == ThreadStatus::Running && thread->CanSchedule()) {
+            do {
+                // We have to do better than the current thread.
+                // This call returns null when that's not possible.
+                std::tie(next_priority, next) =
+                    ready_queue.pop_first_better(thread->current_priority);
+                if (!next) {
+                    // Otherwise just keep going with the current thread
+                    next = thread;
+                    break;
+                } else if (!next->CanSchedule()) {
+                    skipped.push_back({next_priority, next});
+                }
+
+            } while (!next->CanSchedule());
+        } else {
+            do {
+                std::tie(next_priority, next) = ready_queue.pop_first();
+                if (next && !next->CanSchedule()) {
+                    skipped.push_back({next_priority, next});
+                }
+            } while (next && !next->CanSchedule());
+        }
+
+        for (auto it = skipped.rbegin(); it != skipped.rend(); it++) {
+            ready_queue.push_front(it->first, it->second);
+        }
+
+        // Try to time limit the selected thread on core 1
+        if (core_id == 1 && next && GetCpuLimiter()->DoTimeLimit(next)) {
+            // If the thread is time limited, select the next one
+            continue;
+        }
+
+        break;
     }
 
     return next;
@@ -516,7 +555,159 @@ VAddr Thread::GetCommandBufferAddress() const {
     return GetTLSAddress() + command_header_offset;
 }
 
-ThreadManager::ThreadManager(Kernel::KernelSystem& kernel, u32 core_id) : kernel(kernel) {
+bool Thread::SetDebugBreak(bool _debug_break) {
+    if (debug_break == _debug_break) {
+        return false;
+    }
+    debug_break = _debug_break;
+    return true;
+}
+
+CpuLimiter::~CpuLimiter() {}
+
+CpuLimiterMulti::CpuLimiterMulti(Kernel::KernelSystem& _kernel) : kernel(_kernel) {}
+
+void CpuLimiterMulti::Initialize(bool is_single) {
+    // TODO(PabloMK7): The is_single variable is needed to prevent
+    // registering an event twice with the same name. Once CpuLimiterSingle
+    // is implemented we can remove it.
+    tick_event = kernel.timing.RegisterEvent(
+        fmt::format("Kernel::{}::tick_event", is_single ? "CpuLimiterSingle" : "CpuLimiterMulti"),
+        [this](u64, s64 cycles_late) { this->OnTick(cycles_late); });
+}
+
+void CpuLimiterMulti::Start() {
+    if (ready) {
+        return;
+    }
+    ready = true;
+    active = false;
+    curr_state = SchedState::APP; // So that ChangeState starts with SYS
+    app_cpu_time = Core1CpuTime::PREEMPTION_DISABLED;
+}
+
+void CpuLimiterMulti::End() {
+    if (!ready) {
+        return;
+    }
+    ready = false;
+    active = false;
+    kernel.timing.UnscheduleEvent(tick_event, 0);
+    WakeupSleepingThreads();
+}
+
+void CpuLimiterMulti::UpdateAppCpuLimit() {
+    if (!ready) {
+        return;
+    }
+
+    app_cpu_time = static_cast<u32>(kernel.ResourceLimit()
+                                        .GetForCategory(Kernel::ResourceLimitCategory::Application)
+                                        ->GetCurrentValue(Kernel::ResourceLimitType::CpuTime));
+    if (app_cpu_time == Core1CpuTime::PREEMPTION_DISABLED) {
+        // No preemption, disable event
+        active = false;
+        kernel.timing.UnscheduleEvent(tick_event, 0);
+        WakeupSleepingThreads();
+    } else {
+        // Start preempting, enable event
+        if (active) {
+            // If we were active already, unschedule first
+            // so that the event is not scheduled twice.
+            // We could just not call ChangeState instead,
+            // but this allows adjusting the timing of the
+            // event sooner.
+            kernel.timing.UnscheduleEvent(tick_event, 0);
+        }
+        active = true;
+        ChangeState(0);
+    }
+}
+
+bool CpuLimiterMulti::DoTimeLimit(Thread* thread) {
+    if (!ready || !active) {
+        // Preemption is not active, don't do anything.
+        return false;
+    }
+    if (kernel.ResourceLimit()
+            .GetForCategory(thread->resource_limit_category)
+            ->GetLimitValue(ResourceLimitType::CpuTime) == Core1CpuTime::PREEMPTION_EXCEMPTED) {
+        // The thread is excempted from preemption
+        return false;
+    }
+
+    // On real hardware, the kernel uses a KPreemptionTimer to determine if a
+    // thread needs to be time limited. This properly uses the resource limit
+    // value to check if it is a sysmodule or not. We can do this instead and
+    // it should be good enough. TODO(PabloMK7): fix?
+    if (thread->resource_limit_category == ResourceLimitCategory::Application &&
+            curr_state == SchedState::SYS ||
+        thread->resource_limit_category == ResourceLimitCategory::Other &&
+            curr_state == SchedState::APP) {
+        // Block thread as not in the current mode
+        thread->status = ThreadStatus::WaitSleep;
+        sleeping_thread_ids.push(thread->thread_id);
+        return true;
+    }
+    return false;
+}
+
+void CpuLimiterMulti::OnTick(s64 cycles_late) {
+    WakeupSleepingThreads();
+    ChangeState(cycles_late);
+}
+
+void CpuLimiterMulti::ChangeState(s64 cycles_late) {
+    curr_state = (curr_state == SchedState::SYS) ? SchedState::APP : SchedState::SYS;
+
+    s64 next_timer = base_tick_interval * (app_cpu_time / 100.f);
+    if (curr_state == SchedState::SYS) {
+        next_timer = base_tick_interval - next_timer;
+    }
+    if (next_timer > cycles_late) {
+        next_timer -= cycles_late;
+    }
+    kernel.timing.ScheduleEvent(next_timer, tick_event, 0, 1);
+}
+
+void CpuLimiterMulti::WakeupSleepingThreads() {
+    while (!sleeping_thread_ids.empty()) {
+        u32 curr_id = sleeping_thread_ids.front();
+
+        auto thread = kernel.GetThreadManager(1).GetThreadByID(curr_id);
+        if (thread && thread->status == ThreadStatus::WaitSleep) {
+            thread->ResumeFromWait();
+        }
+
+        sleeping_thread_ids.pop();
+    }
+}
+
+template <class Archive>
+void CpuLimiterMulti::serialize(Archive& ar, const unsigned int) {
+    ar & ready;
+    ar & active;
+    ar & app_cpu_time;
+    ar & curr_state;
+    std::vector<u32> v;
+    if (Archive::is_loading::value) {
+        ar & v;
+        for (auto it : v) {
+            sleeping_thread_ids.push(it);
+        }
+    } else {
+        std::queue<u32> temp = sleeping_thread_ids;
+        while (!temp.empty()) {
+            v.push_back(temp.front());
+            temp.pop();
+        }
+        ar & v;
+    }
+}
+
+ThreadManager::ThreadManager(Kernel::KernelSystem& kernel, u32 core_id)
+    : kernel(kernel), core_id(core_id), current_schedule_mode(Core1ScheduleMode::Multi),
+      single_time_limiter(kernel), multi_time_limiter(kernel) {
     ThreadWakeupEventType = kernel.timing.RegisterEvent(
         "ThreadWakeupCallback_" + std::to_string(core_id),
         [this](u64 thread_id, s64 cycle_late) { ThreadWakeupCallback(thread_id, cycle_late); });
